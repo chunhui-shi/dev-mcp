@@ -2,17 +2,21 @@
 # Removes all containers, the Docker network, and optionally the FreeIPA data volume.
 set -euo pipefail
 
-DOMAIN="fed.devtest"
+DOMAIN="${DOMAIN:-fed.devtest}"
 NETWORK="kdc-net"
 
 log() { echo "$(date '+%H:%M:%S') ▶ $*"; }
 
 KEEP_IPA_DATA=false
 CLEAN_OUTPUTS=false
-for arg in "$@"; do
-  [[ "$arg" == "--clean-ipa-data" ]] && KEEP_IPA_DATA=false && true
-  [[ "$arg" == "--keep-ipa-data"  ]] && KEEP_IPA_DATA=true
-  [[ "$arg" == "--clean-outputs"  ]] && CLEAN_OUTPUTS=true
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --domain)        DOMAIN="$2"; shift 2 ;;
+    --clean-ipa-data) KEEP_IPA_DATA=false; shift ;;
+    --keep-ipa-data)  KEEP_IPA_DATA=true; shift ;;
+    --clean-outputs)  CLEAN_OUTPUTS=true; shift ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
 done
 
 for name in "postgres.${DOMAIN}" "freeipa.${DOMAIN}" "dns.${DOMAIN}"; do

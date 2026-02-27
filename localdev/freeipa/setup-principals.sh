@@ -6,8 +6,8 @@
 # Writes keytabs to /root/{postgres,trino}.keytab
 set -euo pipefail
 
-REALM="FED.DEVTEST"
-DOMAIN="fed.devtest"
+REALM="${REALM:-FED.DEVTEST}"
+DOMAIN="${DOMAIN:-fed.devtest}"
 PG_IP="${PG_IP:-172.20.0.12}"
 IPA_HOST="freeipa.${DOMAIN}"
 ADMIN_PASSWORD="${IPA_PASSWORD:?IPA_PASSWORD env var must be set}"

@@ -2,7 +2,8 @@
 # Quick status check for all three containers.
 set -euo pipefail
 
-DOMAIN="fed.devtest"
+DOMAIN="${DOMAIN:-fed.devtest}"
+[[ "${1:-}" == "--domain" ]] && DOMAIN="$2"
 
 ok()   { echo "  ✔ $*"; }
 fail() { echo "  ✖ $*"; }

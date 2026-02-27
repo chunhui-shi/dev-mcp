@@ -3,9 +3,9 @@
 # setup.sh — Bootstrap a local Kerberos + PostgreSQL environment
 #
 # Containers created:
-#   dns.fed.devtest      172.20.0.10  dnsmasq (authoritative for fed.devtest)
-#   freeipa.fed.devtest  172.20.0.11  FreeIPA KDC + LDAP
-#   postgres.fed.devtest 172.20.0.12  PostgreSQL 16 with GSS/Kerberos auth
+#   dns.<domain>      172.20.0.10  dnsmasq (authoritative DNS)
+#   freeipa.<domain>  172.20.0.11  FreeIPA KDC + LDAP
+#   postgres.<domain> 172.20.0.12  PostgreSQL 16 with GSS/Kerberos auth
 #
 # Output (in ./outputs/):
 #   postgres.keytab / postgres.keytab.b64   — PostgreSQL service keytab
@@ -14,15 +14,30 @@
 #   postgres.properties                     — Ready-to-use Trino catalog config
 #
 # Usage:
-#   ./setup.sh              # full setup
-#   ./setup.sh --skip-ipa   # skip FreeIPA install (reuse existing data volume)
+#   ./setup.sh                           # full setup (domain: fed.devtest)
+#   ./setup.sh --domain my.realm         # custom domain
+#   ./setup.sh --skip-ipa                # reuse existing FreeIPA data volume
+#   ./setup.sh --domain my.realm --skip-ipa
 # ============================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── Configuration ─────────────────────────────────────────────────────────
+# ── Argument parsing ───────────────────────────────────────────────────────
 DOMAIN="fed.devtest"
-REALM="FED.DEVTEST"
+SKIP_IPA=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --domain)    DOMAIN="$2"; shift 2 ;;
+    --skip-ipa)  SKIP_IPA=true; shift ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+# Derive realm from domain (uppercase)
+REALM=$(echo "$DOMAIN" | tr '[:lower:]' '[:upper:]')
+
+# ── Configuration ─────────────────────────────────────────────────────────
 NETWORK="kdc-net"
 SUBNET="172.20.0.0/16"
 
@@ -38,14 +53,14 @@ IPA_PASSWORD="${IPA_PASSWORD:-Admin1234!}"
 PG_SUPERPASS="${PG_SUPERPASS:-postgres}"
 OUTPUTS="${SCRIPT_DIR}/outputs"
 
-SKIP_IPA=false
-[[ "${1:-}" == "--skip-ipa" ]] && SKIP_IPA=true
-
 mkdir -p "$OUTPUTS"
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 log()  { echo "$(date '+%H:%M:%S') ▶ $*"; }
 fail() { echo "$(date '+%H:%M:%S') ✖ $*" >&2; exit 1; }
+
+# Reverse an IPv4 address for PTR records: 172.20.0.10 → 10.0.20.172
+reverse_ip() { echo "$1" | awk -F. '{print $4"."$3"."$2"."$1}'; }
 
 wait_ready() {
   local name=$1 cmd=$2 attempts=${3:-60} interval=${4:-10}
@@ -70,6 +85,26 @@ remove_if_exists() {
   fi
 }
 
+# Generate a file from a .tpl template by substituting shell variables.
+# Uses envsubst when available, falls back to sed.
+render_template() {
+  local tpl=$1 out=$2
+  if command -v envsubst >/dev/null 2>&1; then
+    envsubst < "$tpl" > "$out"
+  else
+    sed \
+      -e "s|\${DOMAIN}|${DOMAIN}|g" \
+      -e "s|\${REALM}|${REALM}|g"   \
+      -e "s|\${DNS_IP}|${DNS_IP}|g" \
+      -e "s|\${IPA_IP}|${IPA_IP}|g" \
+      -e "s|\${PG_IP}|${PG_IP}|g"   \
+      -e "s|\${DNS_PTR}|${DNS_PTR}|g" \
+      -e "s|\${IPA_PTR}|${IPA_PTR}|g" \
+      -e "s|\${PG_PTR}|${PG_PTR}|g"   \
+      "$tpl" > "$out"
+  fi
+}
+
 # ── Detect cgroup version (affects FreeIPA / systemd containers) ──────────
 if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
   log "Detected cgroup v2"
@@ -78,6 +113,21 @@ else
   log "Detected cgroup v1"
   CGROUP_OPTS="-v /sys/fs/cgroup:/sys/fs/cgroup:ro"
 fi
+
+# ── Generate config files from templates ──────────────────────────────────
+log "Domain: ${DOMAIN}  Realm: ${REALM}"
+
+DNS_PTR=$(reverse_ip "$DNS_IP")
+IPA_PTR=$(reverse_ip "$IPA_IP")
+PG_PTR=$(reverse_ip "$PG_IP")
+
+export DOMAIN REALM DNS_IP IPA_IP PG_IP DNS_PTR IPA_PTR PG_PTR
+
+log "Generating dns/dnsmasq.conf from template..."
+render_template "${SCRIPT_DIR}/dns/dnsmasq.conf.tpl" "${SCRIPT_DIR}/dns/dnsmasq.conf"
+
+log "Generating krb5.conf from template..."
+render_template "${SCRIPT_DIR}/krb5.conf.tpl" "${SCRIPT_DIR}/krb5.conf"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Step 1 — Docker network
@@ -96,6 +146,7 @@ fi
 log "=== Step 2: DNS container ($DNS_NAME) ==="
 remove_if_exists "$DNS_NAME"
 
+# dnsmasq.conf was generated above from the template; bake it into the image
 docker build -t kdc-dns "${SCRIPT_DIR}/dns/" -q
 
 docker run -d \
@@ -160,6 +211,8 @@ log "=== Step 4: Kerberos principals and keytabs ==="
 docker exec \
   -e IPA_PASSWORD="$IPA_PASSWORD" \
   -e PG_IP="$PG_IP" \
+  -e DOMAIN="$DOMAIN" \
+  -e REALM="$REALM" \
   "$IPA_NAME" \
   bash -s < "${SCRIPT_DIR}/freeipa/setup-principals.sh"
 
@@ -206,7 +259,7 @@ docker cp "${OUTPUTS}/postgres.keytab" "$PG_NAME":/etc/postgresql/krb5.keytab
 docker exec "$PG_NAME" bash -c \
   "chown postgres:postgres /etc/postgresql/krb5.keytab && chmod 600 /etc/postgresql/krb5.keytab"
 
-# Drop krb5.conf so the container can use Kerberos tools
+# Drop krb5.conf (generated from template) so the container can use Kerberos tools
 docker cp "${SCRIPT_DIR}/krb5.conf" "$PG_NAME":/etc/krb5.conf
 
 # Configure postgresql.conf + pg_hba.conf and reload
@@ -243,16 +296,16 @@ if $NEED_HOSTS; then
   fi
 fi
 
-# Copy krb5.conf to outputs for distribution
+# Copy generated krb5.conf to outputs for distribution
 cp "${SCRIPT_DIR}/krb5.conf" "${OUTPUTS}/krb5.conf"
 
 # Write Trino catalog config
 TRINO_KEYTAB_B64=$(cat "${OUTPUTS}/trino.keytab.b64")
 cat > "${OUTPUTS}/postgres.properties" << EOF
 connector.name=postgresql
-connection-url=jdbc:postgresql://postgres.fed.devtest:5432/testdb
+connection-url=jdbc:postgresql://${PG_NAME}:5432/testdb
 postgresql.authentication.type=KERBEROS
-kerberos.client.principal=trino@FED.DEVTEST
+kerberos.client.principal=trino@${REALM}
 kerberos.client.keytab-base64=${TRINO_KEYTAB_B64}
 EOF
 
@@ -262,9 +315,9 @@ log "═════════════════════════
 log " Setup complete!"
 log "══════════════════════════════════════════════════════"
 log " Containers:"
-log "   dns.fed.devtest      ${DNS_IP}  (dnsmasq)"
-log "   freeipa.fed.devtest  ${IPA_IP}  (KDC, admin: admin / ${IPA_PASSWORD})"
-log "   postgres.fed.devtest ${PG_IP}   (PostgreSQL, user: postgres / ${PG_SUPERPASS})"
+log "   ${DNS_NAME}      ${DNS_IP}  (dnsmasq)"
+log "   ${IPA_NAME}  ${IPA_IP}  (KDC, admin: admin / ${IPA_PASSWORD})"
+log "   ${PG_NAME} ${PG_IP}   (PostgreSQL, user: postgres / ${PG_SUPERPASS})"
 log ""
 log " Outputs in ${OUTPUTS}/:"
 log "   postgres.keytab.b64  — service keytab (PostgreSQL)"
@@ -274,8 +327,8 @@ log "   postgres.properties  — Trino catalog config (needs postgresql connecto
 log "                          with Kerberos support wired in)"
 log ""
 log " Quick smoke test:"
-log "   docker exec postgres.fed.devtest bash -c \\"
-log "     'kinit -kt /tmp/trino.keytab trino@FED.DEVTEST && \\"
-log "      psql -h postgres.fed.devtest -U trino -d testdb -c \"SELECT * FROM test.hello;\"'"
+log "   docker exec ${PG_NAME} bash -c \\"
+log "     'kinit -kt /tmp/trino.keytab trino@${REALM} && \\"
+log "      psql -h ${PG_NAME} -U trino -d testdb -c \"SELECT * FROM test.hello;\"'"
 log ""
 log " To tear down: ./teardown.sh"
