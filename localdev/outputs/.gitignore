@@ -1,0 +1,5 @@
+# Generated files — do not commit
+*.keytab
+*.keytab.b64
+*.properties
+krb5.conf
